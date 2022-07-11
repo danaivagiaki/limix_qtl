@@ -29,7 +29,8 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                      seed=np.random.randint(40000), n_perm=0, write_permutations = False, write_zscore = False, write_feature_top_permutations = False,
                      relatedness_score=0.95, feature_variant_covariate_filename = None, snps_filename=None, feature_filename=None,
                      snp_feature_filename=None, genetic_range='all', covariates_filename=None, randomeff_filename=None,
-                     sample_mapping_filename=None, extended_anno_filename=None, regressCovariatesUpfront = False, lr_random_effect = False, debugger=False):
+                     sample_mapping_filename=None, extended_anno_filename=None, regressCovariatesUpfront = False, lr_random_effect = False, debugger=False,
+                    return_random_effects=False):
     if debugger:
         fun_start = time.time()
     
@@ -241,8 +242,11 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
             '''select indices for relevant individuals in genotype matrix
             These are not unique. NOT to be used to access phenotype/covariates data
             '''
-            individual_ids = sample2individual_df.loc[phenotype_ds.index,'iid'].values
+            individual_ids = sample2individual_df.loc[phenotype_ds.index,'iid'].values # donor IDs but len(samples)
             sample2individual_feature= sample2individual_df.loc[phenotype_ds.index]
+            ####
+            individual_ids_sample_dict = dict(zip(sample2individual_df.loc[phenotype_ds.index,"sample"].values, sample2individual_df.loc[phenotype_ds.index,'iid'].values))
+            ####
             
             if(contains_missing_samples):
                 tmp_unique_individuals = geneticaly_unique_individuals
@@ -299,16 +303,37 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                     fun_start = time.time()
                 if kinship_df is not None and randomeff_df is None:
                     if( not lr_random_effect):
-                        kinship_mat = kinship_df.loc[individual_ids,individual_ids].values
+                        print("\nKinship_df shape: {}\n".format(kinship_df.shape))
+                        kinship_mat = kinship_df.loc[individual_ids,individual_ids].values # samples x samples
                         kinship_mat = kinship_mat.astype(float)
                         ##GOWER normalization of Kinship matrix.
                         kinship_mat *= (kinship_mat.shape[0] - 1) / (kinship_mat.trace() - kinship_mat.mean(0).sum())
+                        ####
+                        if return_random_effects:
+                            kinship_df.loc[individual_ids,individual_ids].to_csv(
+                                os.path.join(output_dir, "Kinship_samples-samples.tsv"),
+                                sep='\t', index=True, header=True
+                            )
+                            pd.DataFrame(kinship_mat, index=individual_ids, columns=individual_ids).to_csv(
+                                os.path.join(output_dir, "normalised-Kinship_samples-samples.tsv"),
+                                sep='\t',index=True, header=True
+                            )
+                            sys.exit()
+                        ####
                         ## This needs to go with the subselection stuff.
                         if(QS is None or contains_missing_samples):
                             QS = utils.economic_qs(kinship_mat)
                     elif(lr_random_effect):
-                        kinship_mat = kinship_df.loc[individual_ids,:].values
+                        kinship_mat = kinship_df.loc[individual_ids,:].values # == kinship_df.loc[individual_ids, geneticaly_unique_individuals].values
                         kinship_mat = kinship_mat.astype(float)
+                        ####
+                        if return_random_effects:
+                            kinship_df.loc[individual_ids, :].to_csv(
+                                os.path.join(output_dir, "Kinship_samples-donors.tsv"),
+                                sep='\t', index=True, header=True
+                            )
+                            sys.exit()
+                        ####
                         if(QS is None or contains_missing_samples):
                             QS = utils.economic_qs_linear(kinship_mat, return_q1=False)
                 # combining the two matrices
@@ -317,7 +342,7 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                     if( not lr_random_effect):
                         randomeff_mix = True
                         if(not Sigma_qs or contains_missing_samples):
-                            kinship_mat = kinship_df.loc[individual_ids,individual_ids].values
+                            kinship_mat = kinship_df.loc[individual_ids,individual_ids].values # samples x samples
                             kinship_mat = kinship_mat.astype(float)
                             randomeff_mat = randomeff_df.loc[sample2individual_feature['sample'],sample2individual_feature['sample']].values
                             randomeff_mat = randomeff_mat.astype(float)
@@ -331,11 +356,20 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                                 ##GOWER normalization of Kinship matrix.
                                 Sigma[rho] *= (Sigma[rho].shape[0] - 1) / (Sigma[rho].trace() - Sigma[rho].mean(0).sum())
                                 Sigma_qs[rho] = utils.economic_qs(Sigma[rho])
+                            ####
+                            if return_random_effects:
+                                pd.DataFrame(Sigma, index=individual_ids, columns=individual_ids).to_csv(
+                                os.path.join(output_dir, "Mixed-random-effects_samples-samples.tsv"),
+                                    sep='\t',index=True, header=True
+                                )
+                                sys.exit()
+                            ####
+  
                     elif(lr_random_effect):
                         randomeff_mix = True
                         if(not Sigma_qs or contains_missing_samples):
                             ##We only take the genetically unique indivudals to reflect the kinship here.
-                            kinship_mat = kinship_df.loc[individual_ids,geneticaly_unique_individuals].values
+                            kinship_mat = kinship_df.loc[individual_ids,geneticaly_unique_individuals].values # samples x individuals
                             kinship_mat = kinship_mat.astype(float)
                             randomeff_mat = randomeff_df.loc[sample2individual_feature['sample'],:].values
                             randomeff_mat = randomeff_mat.astype(float)
@@ -343,10 +377,24 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                             if (kinship_mat.shape[0] != randomeff_mat.shape[0]):
                                 print ('There is an issue in mapping between the second random effect term and the main association information.')
                                 sys.exit()
-                            
+                                
+                            Sigma = {}
                             for rho in rho1:
+                                ####
+                                Sigma[rho] = np.sqrt(rho) * kinship_mat + np.sqrt(1 - rho) * randomeff_mat
+                                ####
                                 ##Stck the two matrices together [per rho value]
                                 Sigma_qs[rho] = utils.economic_qs_linear(np.concatenate([np.sqrt(rho) * kinship_mat] + [np.sqrt(1 - rho) * randomeff_mat], axis=1), return_q1=False)
+                            ####                            
+                            if return_random_effects:
+                                pd.DataFrame(Sigma, index=individual_ids, columns=geneticaly_unique_individuals).to_csv(
+                                os.path.join(output_dir, "Mixed-random-effects_samples-donors.tsv"),
+                                    sep='\t', index=True, header=True
+                                )
+                                sys.exit()
+                            ####
+  
+  
 
                 ##This cant happen!
                 # if kinship_df is None and randomeff_df is not None: 
@@ -821,6 +869,7 @@ if __name__=='__main__':
     write_feature_top_permutations = args.write_feature_top_permutations
     lr_random_effect = args.low_rank_random_effect
     debugger = args.debugger
+    return_re = args.return_random_effects
 
     if ((plink is None) and (bgen is None)):
         raise ValueError("No genotypes provided. Either specify a path to a binary plink genotype file or a bgen file.")
@@ -856,4 +905,5 @@ if __name__=='__main__':
                      cis_mode=cis, skipAutosomeFiltering= includeAllChromsomes, gaussianize_method = gaussianize, minimum_test_samples= int(minimum_test_samples), seed=int(random_seed),
                      n_perm=int(n_perm), write_permutations = write_permutations, write_zscore = write_zscore, write_feature_top_permutations = write_feature_top_permutations, relatedness_score=relatedness_score, feature_variant_covariate_filename = feature_variant_covariate_filename,
                      snps_filename=snps_filename, feature_filename=feature_filename, snp_feature_filename=snp_feature_filename, genetic_range=genetic_range, covariates_filename=covariates_file,
-                     randomeff_filename=randeff_file, sample_mapping_filename=samplemap_file, extended_anno_filename=extended_anno_file, regressCovariatesUpfront = regressBefore, lr_random_effect = lr_random_effect, debugger= debugger)
+                     randomeff_filename=randeff_file, sample_mapping_filename=samplemap_file, extended_anno_filename=extended_anno_file, regressCovariatesUpfront = regressBefore, lr_random_effect = lr_random_effect, debugger= debugger,
+                    return_random_effects = return_re)

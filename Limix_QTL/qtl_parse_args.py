@@ -64,6 +64,9 @@ def get_args():
     parser.add_argument("--debugger","-d",
                         action="store_true",
                         help="Print the time needed for each step", default=False)
+    parser.add_argument("--return_random_effects",
+                        action="store_true", default=False)
+  
     args = parser.parse_args()
     return args
 
