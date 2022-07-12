@@ -29,9 +29,9 @@ def minimal_qtl_processing(QTL_Dir, OutputDir, writeToOneFile=True, compressed =
         if(debugMode):
             print(partTmp)
         if(writeToOneFile):
-            outputFile = OutputDir+output_file+"all.txt"
+            outputFile = os.path.join(OutputDir, output_file+"all.txt")
         else:
-            outputFile = OutputDir+output_file+partTmp+".txt"
+            outputFile = os.path.join(OutputDir, output_file+partTmp+".txt")
 
         #print(outputFile)
         if(((os.path.isfile(outputFile) or os.path.isfile(outputFile+".gz")) and not overWrite) and not writeToOneFile):
