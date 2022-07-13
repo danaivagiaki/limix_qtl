@@ -13,8 +13,6 @@ if (length(args)<3 || length(args)>4) {
 folder = args[1]
 folderOut = args[2]
 fdrLevel = as.numeric(args[3])
-permutations = args[4]
-
 
 filterFile= NULL
 if(length(args)==4){
@@ -41,14 +39,14 @@ if(!is.null(filterFile)){
 	qtlResults <- qtlResults[which(qtlResults$feature_id %in% relevantGenes),]
 }
 
-pval_column <- ifelse(permutations, "empirical_feature_p_value", "p_value")
+pval_column <- ifelse(all(qtlResults$empirical_feature_p_value == -1), "p_value", "empirical_feature_p_value")
 
-qtlResults$global_corrected_pValue <- qvalue(qtlResults[pval_column])$qvalues
-qtlResults$global_corrected_pValue_BH <- multtest::mt.rawp2adjp(qtlResults[pval_column],proc = "BH")$adjp[,2]
-qtlResults$global_corrected_pValue_BF <- multtest::mt.rawp2adjp(qtlResults[pval_column],proc = "Bonferroni")$adjp[,2]
+qtlResults$global_corrected_pValue <- qvalue(qtlResults[,pval_column])$qvalues
+qtlResults$global_corrected_pValue_BH <- multtest::mt.rawp2adjp(qtlResults[,pval_column],proc = "BH")$adjp[,2]
+qtlResults$global_corrected_pValue_BF <- multtest::mt.rawp2adjp(qtlResults[,pval_column],proc = "Bonferroni")$adjp[,2]
 
 ##To extract data from the full file.
-minimal_p <- max(qtlResults[pval_column][which(qtlResults$global_corrected_pValue<fdrLevel)])
+minimal_p <- max(qtlResults[,pval_column][which(qtlResults$global_corrected_pValue<fdrLevel)])
 
 write.table(qtlResults, paste(folderOut,"/top_qtl_results_all_FDR.txt",sep=""), quote = F, row.names=F, sep="\t" )
 write.table(qtlResults[qtlResults$global_corrected_pValue<fdrLevel,], paste0(folderOut, "/top_qtl_results_all_FDR", str_replace(fdrLevel, "\\.", ""), ".txt"), quote = F, row.names=F, sep="\t" )
