@@ -378,22 +378,19 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
                                 print ('There is an issue in mapping between the second random effect term and the main association information.')
                                 sys.exit()
                                 
-                            Sigma = {}
+
                             for rho in rho1:
-                                ####
-                                Sigma[rho] = np.sqrt(rho) * kinship_mat + np.sqrt(1 - rho) * randomeff_mat
-                                ####
                                 ##Stck the two matrices together [per rho value]
                                 Sigma_qs[rho] = utils.economic_qs_linear(np.concatenate([np.sqrt(rho) * kinship_mat] + [np.sqrt(1 - rho) * randomeff_mat], axis=1), return_q1=False)
                             ####                            
                             if return_random_effects:
-                                pd.DataFrame(Sigma, index=individual_ids, columns=geneticaly_unique_individuals).to_csv(
+                                pd.DataFrame(Sigma_qs, index=individual_ids, columns=geneticaly_unique_individuals).to_csv(
                                 os.path.join(output_dir, "Mixed-random-effects_samples-donors.tsv"),
                                     sep='\t', index=True, header=True
                                 )
                                 sys.exit()
                             ####
-  
+
   
 
                 ##This cant happen!
