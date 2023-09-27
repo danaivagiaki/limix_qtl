@@ -4,7 +4,6 @@ import os.path
 import numpy as np
 import pandas as pd
 import argparse
-import glob
 import pdb
 
 def minimal_qtl_processing(QTL_Dir, OutputDir, writeToOneFile=True, compressed = False, overWrite=True, minimalPValue = 1, minimalFeaturePValue = 1, topMode = False, debugMode = False):
@@ -58,9 +57,11 @@ def minimal_qtl_processing(QTL_Dir, OutputDir, writeToOneFile=True, compressed =
         ffea = ffea.rename(index=str, columns={"chromosome": "feature_chromosome", "start": "feature_start", "end": "feature_end"})
         fsnp = fsnp.rename(index=str, columns={"chromosome": "snp_chromosome", "position": "snp_position"})
 
-
-        frez=h5py.File(file,'r')
-        frezkeys= np.array([k.replace('_i_','') for k in list(frez.keys())])
+        try:
+            frez=h5py.File(file,'r')
+            frezkeys= np.array([k.replace('_i_','') for k in list(frez.keys())])
+        except OSError:
+            print(f"Issue in eQTL results. Skipping\n{file}")
 
         data={}
         for key in ['feature_id','snp_id','p_value','beta','beta_se','empirical_feature_p_value']:
