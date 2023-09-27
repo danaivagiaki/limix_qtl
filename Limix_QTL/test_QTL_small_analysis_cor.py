@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 
-from run_QTL_analysis2 import run_QTL_analysis
+from run_QTL_analysis_cor import run_QTL_analysis
 from qtl_utilities import merge_QTL_results
 import subprocess
 import numpy as np
@@ -46,7 +46,7 @@ def test_QTL_analysis():
                      blocksize,cis_mode=True, seed=randomSeed, n_perm=100, snps_filename=None,feature_filename = None,
                      genetic_range=chromosome,
                      covariates_filename=covariates_filename,
-                     write_permutations = True,
+                     write_permutations = False,
                      sample_mapping_filename=individual2sample_filename)
 
 if __name__=='__main__':

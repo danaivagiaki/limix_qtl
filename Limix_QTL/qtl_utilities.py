@@ -11,8 +11,10 @@ from scipy.stats import chi2
 import qtl_loader_utils
 import pdb
 from glimix_core.lmm import LMM
-from numpy.linalg import eigh, svd
+from glimix_core.glmm._glmm import GLMM
+from numpy.linalg import eigh, svd, pinv, solve, norm
 import dask.array as da
+import random
 
 def run_QTL_analysis_load_intersect_phenotype_covariates_kinship_sample_mapping(pheno_filename, anno_filename, geno_prefix,
         plinkGenotype, minimum_test_samples= 10, relatedness_score=None, cis_mode=True, skipAutosomeFiltering = False, snps_filename=None,
@@ -159,7 +161,7 @@ def run_QTL_analysis_load_intersect_phenotype_covariates_kinship_sample_mapping(
     print("Number of samples with genotype & phenotype data: " + str(sample2individual_df.shape[0]))
     if(sample2individual_df.shape[0]<minimum_test_samples):
         print("Not enough samples with both genotype & phenotype data.")
-        sys.exit()
+        sys.exit(1)
         
     ##Filter now the actual data!
     #Filter phenotype data based on the linking files.
@@ -484,7 +486,7 @@ def merge_QTL_results(results_dir):
     hdf5_outfile.close()
 
 def chunker(seq, size):
-    return (seq[pos:pos + np.int(size)] for pos in range(0, len(seq), np.int(size)))
+    return (seq[pos:pos + int(size)] for pos in range(0, len(seq), int(size)))
 
 def get_unique_genetic_samples(kinship_df, relatedness_score):
 #    tril returns the lower triungular.
@@ -546,40 +548,6 @@ def force_normal_distribution(phenotype, method='gaussnorm', reference=None):
     else:
         print ('methods are: log, log_standardize, standardize, gaussnorm, ranknorm, ranknorm_duplicates, arcsin, arcsin_standardize')
 
-#get_shuffeld_genotypes_preserving_kinship(genetically_unique_individuals, relatedness_score, snp_matrix_DF,kinship_df.loc[individual_ids,individual_ids], n_perm)
-def get_shuffeld_genotypes_preserving_kinship(genetically_unique_individuals, relatedness_score, snp_matrix_DF,kinship_df1,n_perm):
-
-    # take only one line for replicates (those with the same name)
-    boolean_selection = ~snp_matrix_DF.index.duplicated()
-    temp = snp_matrix_DF.loc[boolean_selection,:]
-
-    boolean_selection = ~kinship_df1.index.duplicated()
-    kinship_df1 = kinship_df1.loc[boolean_selection, boolean_selection]
-
-    # subset snp matrix to genetically_unique_individuals
-    u_snp_matrix = temp.loc[genetically_unique_individuals,:]
-
-    '''has replicates but not same lines form donor (np.setdiff1d(individual_ids,genetically_unique_individuals))'''
-    #Shuffle and reinflate
-    locationBuffer = np.zeros(snp_matrix_DF.shape[0], dtype=np.int)
-    #Prepare location search for permuted snp_matrix_df.
-    index_samples = np.arange(u_snp_matrix.shape[0])
-    for index,current_name in enumerate(genetically_unique_individuals):
-        # find all samples that are related to current_name, or are current_name itself.
-        kinship_row = kinship_df1.loc[current_name]
-        selection = np.logical_or(kinship_row>=relatedness_score, kinship_row.index==current_name)
-        locationBuffer[np.where(selection)] = index 
-    snp_matrix_copy = np.zeros((snp_matrix_DF.shape[0],snp_matrix_DF.shape[1]*n_perm))
-    counter = 0
-    end = (snp_matrix_DF.shape[1])
-    for perm_id in range(0,n_perm) :
-        np.random.shuffle(index_samples)
-        temp_u = u_snp_matrix.values[index_samples,:]
-        snp_matrix_copy[:,counter:end] = temp_u[locationBuffer,:]
-        counter+= snp_matrix_DF.shape[1]
-        end+= snp_matrix_DF.shape[1]
-    return(snp_matrix_copy)
-
 def get_shuffeld_genotypes(snp_matrix_DF,n_perm):
     snp_matrix_copy = np.zeros((snp_matrix_DF.shape[0],snp_matrix_DF.shape[1]*n_perm))
     counter = 0
@@ -591,6 +559,114 @@ def get_shuffeld_genotypes(snp_matrix_DF,n_perm):
         snp_matrix_copy[:,counter:end] = snp_matrix_DF.values[index_samples,:]
         counter+= snp_matrix_DF.shape[1]
         end+= snp_matrix_DF.shape[1]
+    return(snp_matrix_copy)
+
+#get_shuffeld_genotypes_preserving_kinship(genetically_unique_individuals, relatedness_score, snp_matrix_DF,kinship_df.loc[individual_ids,individual_ids], n_perm)
+def get_shuffeld_genotypes_preserving_kinship(genetically_unique_individuals, relatedness_score, snp_matrix_DF,kinship_df1,n_perm):
+    snp_matrix_copy = None
+    if relatedness_score is None:
+        print("Warning: trying to perserve kinship when permuting but no relatedness score is provided. Please use a normalize kiship with cutoff to use this functionality. \nDefaulting to regular shuffleing.")
+        snp_matrix_copy = get_shuffeld_genotypes(snp_matrix_DF,n_perm)
+    else :
+        # take only one line for replicates (those with the same name)
+        boolean_selection = ~snp_matrix_DF.index.duplicated()
+        temp = snp_matrix_DF.loc[boolean_selection,:]
+        
+        boolean_selection = ~kinship_df1.index.duplicated()
+        kinship_df1 = kinship_df1.loc[boolean_selection, boolean_selection]
+        
+        # subset snp matrix to genetically_unique_individuals
+        u_snp_matrix = temp.loc[genetically_unique_individuals,:]
+    
+        '''has replicates but not same lines form donor (np.setdiff1d(individual_ids,genetically_unique_individuals))'''
+        #Shuffle and reinflate
+        locationBuffer = np.zeros(snp_matrix_DF.shape[0], dtype=int)
+        #Prepare location search for permuted snp_matrix_df.
+        index_samples = np.arange(u_snp_matrix.shape[0])
+        for index,current_name in enumerate(genetically_unique_individuals):
+            # find all samples that are related to current_name, or are current_name itself.
+            kinship_row = kinship_df1.loc[current_name]
+            selection = np.logical_or(kinship_row>=relatedness_score, kinship_row.index==current_name)
+            locationBuffer[np.where(selection)] = index 
+        snp_matrix_copy = np.zeros((snp_matrix_DF.shape[0],snp_matrix_DF.shape[1]*n_perm))
+        counter = 0
+        end = (snp_matrix_DF.shape[1])
+        for perm_id in range(0,n_perm) :
+            np.random.shuffle(index_samples)
+            temp_u = u_snp_matrix.values[index_samples,:]
+            snp_matrix_copy[:,counter:end] = temp_u[locationBuffer,:]
+            counter+= snp_matrix_DF.shape[1]
+            end+= snp_matrix_DF.shape[1]
+    return(snp_matrix_copy)
+
+def get_shuffled_interactions_preserving_kinship(snp_matrix_DF, kinship_df1, inter, genetically_unique_individuals, individual_ids, relatedness_score, sample2individual_feature, n_perm):
+    
+    snp_matrix_copy = None
+    if relatedness_score is None:
+        print("Warning: trying to perserve kinship when permuting but no relatedness score is provided. Please use a normalize kiship with cutoff to use this functionality. \nDefaulting to regular shuffleing.")
+        temp = pd.DataFrame(np.atleast_2d((snp_matrix_DF.iloc[:,0].values * inter.values).T).T,index=snp_matrix_DF.index,columns=snp_matrix_DF.columns)
+        snp_matrix_copy = get_shuffeld_genotypes(temp,n_perm)
+        snp_matrix_copy = pd.DataFrame(data=snp_matrix_copy, index=u_snp_matrix.index)
+        snp_matrix_copy = snp_matrix_copy.loc[individual_ids,:]
+    else :
+        # take only one line for replicates (those with the same name)
+        boolean_selection = ~snp_matrix_DF.index.duplicated()
+        temp = snp_matrix_DF.loc[boolean_selection,:]
+        
+        boolean_selection = ~kinship_df1.index.duplicated()
+        kinship_df1 = kinship_df1.loc[boolean_selection, boolean_selection]
+        # subset snp matrix to genetically_unique_individuals
+        u_snp_matrix = temp.loc[genetically_unique_individuals,:]
+        kinship_df1_u = kinship_df1.loc[genetically_unique_individuals,genetically_unique_individuals]
+        '''has replicates but not same lines form donor (np.setdiff1d(individual_ids,genetically_unique_individuals))'''
+        #pdb.set_trace()
+        #Shuffle and reinflate.
+        locationBuffer = np.zeros(temp.shape[0], dtype=int)
+        #Prepare location search for permuted snp_matrix_df.
+        index_samples = np.arange(u_snp_matrix.shape[0])
+        
+        for index,current_name in enumerate(genetically_unique_individuals):
+            # find all samples that are related to current_name, or are current_name itself.
+            kinship_row = kinship_df1_u.loc[current_name]
+            selection = np.logical_or(kinship_row>=relatedness_score, kinship_row.index==current_name)
+            locationBuffer[np.where(selection)] = index
+        #pdb.set_trace()
+        
+        snp_matrix_copy = np.zeros((temp.shape[0],temp.shape[1]*n_perm))
+        individual_index = np.empty((temp.shape[0],n_perm), dtype='object')
+        individual_index[:] = 'NA'
+        ##inter_copy = np.zeros((temp.shape[0],temp.shape[1]*n_perm)) ##We are here
+        counter = 0
+        end = (temp.shape[1])
+        
+        for perm_id in range(0,n_perm) :
+            np.random.shuffle(index_samples)
+            snp_matrix_copy[:,counter:end] = u_snp_matrix.values[index_samples[locationBuffer],:]
+            individual_index[:,perm_id] = u_snp_matrix.index[index_samples[locationBuffer]].values
+            counter+= temp.shape[1]
+            end+= temp.shape[1]
+        #pdb.set_trace()
+        
+        ##Re-inflate.
+        snp_matrix_copy = pd.DataFrame(data=snp_matrix_copy, index=u_snp_matrix.index)
+        snp_matrix_copy = snp_matrix_copy.loc[individual_ids,:]
+        
+        individual_index = pd.DataFrame(data=individual_index, index=u_snp_matrix.index)
+        individual_index = individual_index.loc[individual_ids,:]
+        
+        counter = 0
+        end = (temp.shape[1])
+        sys_random = random.SystemRandom()
+        for perm_id in range(0,n_perm):
+            expIds = []
+            for rel in individual_index.iloc[:,perm_id] :
+                expIds.append(sample2individual_feature.iloc[sys_random.choice(np.where(sample2individual_feature.iloc[:,0]==rel)[0]),1])
+            #pdb.set_trace()
+            snp_matrix_copy.iloc[:,counter:end] = np.multiply(snp_matrix_copy.iloc[:,counter:end].values.T,inter.loc[expIds].values).T
+            counter+= temp.shape[1]
+            end+= temp.shape[1]
+        
+        #pdb.set_trace()
     return(snp_matrix_copy)
 
 def qtl_plot(snp_matrix_DF, phenotype,K=None, M=None,LMM=None,snp=None,show_reg_cov=True):
@@ -867,7 +943,8 @@ def rhoTestBF(best, phenotype, cov_matrix, Sigma_qs, mixed, lastMove, rhoArray, 
     
     if(len(loc)==1):
         #We have one optimum.
-        print(rhoArray[loc[0]])
+        if verbose:
+                print(rhoArray[loc[0]])
         mixingParameters["rho"] = rhoArray[loc[0]]
         mixingParameters["lmm"] =  bestLmm
     else :
@@ -931,15 +1008,15 @@ def economic_qs(K, epsilon=np.sqrt(np.finfo(float).eps)):
     Returns:
         tuple: ``((Q0, Q1), S0)``.
     """
-
+    
     (S, Q) = eigh(K)
-
+    
     nok = abs(max(Q[0].min(), Q[0].max(), key=abs)) < epsilon
     nok = nok and abs(max(K.min(), K.max(), key=abs)) >= epsilon
     if nok:
         from scipy.linalg import eigh as sp_eigh
         (S, Q) = sp_eigh(K)
-
+    
     ok = S >= epsilon
     nok = np.logical_not(ok)
     S0 = S[ok]
@@ -961,13 +1038,13 @@ def economic_qs_linear(G, return_q1=True):
     Returns:
         tuple: ((𝚀₀, 𝚀₁), 𝚂₀).
     """
-
+    
     if not isinstance(G, da.Array):
         G = np.asarray(G, float)
-
+    
     if not return_q1:
         return _economic_qs_linear_noq1(G)
-
+    
     if G.shape[0] > G.shape[1]:
         (Q, Ssq, _) = svd(G, full_matrices=True)
         S0 = Ssq ** 2
@@ -1010,3 +1087,91 @@ def lrt_pvalues(null_lml, alt_lmls, dof=1):
     lrs = clip(-2 * null_lml + 2 * np.asarray(alt_lmls, float), super_tiny, inf)
     pv = chi2(df=dof).sf(lrs)
     return clip(pv, super_tiny, 1 - tiny)
+
+def ddot(L, R, left=None, out=None):
+    r"""Dot product of a matrix and a diagonal one.
+    Args:
+        L (array_like): Left matrix.
+        R (array_like): Right matrix.
+        out (:class:`numpy.ndarray`, optional): copy result to.
+    Returns:
+        :class:`numpy.ndarray`: Resulting matrix.
+    """
+    L = np.asarray(L, float)
+    R = np.asarray(R, float)
+    if left is None:
+        ok = min(L.ndim, R.ndim) == 1 and max(L.ndim, R.ndim) == 2
+        if not ok:
+            msg = "Wrong array layout. One array should have"
+            msg += " ndim=1 and the other one ndim=2."
+            raise ValueError(msg)
+        left = L.ndim == 1
+    if left:
+        if out is None:
+            out = np.copy(R)
+        L = L.reshape(list(L.shape) + [1] * (R.ndim - 1))
+        return np.multiply(L, R, out=out)
+    else:
+        if out is None:
+            out = np.copy(L)
+        return np.multiply(L, R, out=out)
+
+def sum2diag(A, D, out=None):
+    r"""Add values ``D`` to the diagonal of matrix ``A``.
+    Args:
+        A (array_like): Left-hand side.
+        D (array_like or float): Values to add.
+        out (:class:`numpy.ndarray`, optional): copy result to.
+    Returns:
+        :class:`numpy.ndarray`: Resulting matrix.
+    """
+    A = np.asarray(A, float)
+    D = np.asarray(D, float)
+    if out is None:
+        out = np.copy(A)
+    else:
+        np.copyto(out, A)
+    np.einsum("ii->i", out)[:] += D
+    return out
+
+def glmm_posteriori_covariance_safe_decomposition(objct, feature):
+    """Covariance of the estimated posteriori."""
+    # We want to compute the posterior covariance:
+    #   (K⁻¹ + T⁻¹)⁻¹ = (QS⁻¹Qᵗ + T⁻¹)⁻¹ = T - TQ(S + QᵗTQ)⁻¹QᵗT
+    
+    K = GLMM.covariance(objct)
+    S, Q = eigh(K)
+    T = objct._ep._posterior.tau
+    
+    M = Q.T @ ddot(T, Q, left=True)
+    L = ddot(T, Q, left=True)
+    R = L.T
+    posterior_covariance = -sum2diag(L @ solve(sum2diag(M, S), R), -T)
+    
+    return posterior_covariance
+    
+##OLD
+#def glmm_posteriori_covariance_safe_decomposition(objct, feature):
+#    # We want to compute the posterior covariance:
+#    # 
+#    #   (K⁻¹ + T⁻¹)⁻¹ = (QS⁻¹Qᵗ + T⁻¹)⁻¹ = T - TQ(S + QᵗTQ)⁻¹QᵗT
+#    
+#    r"""Covariance of the estimated posteriori."""
+#    
+#    K = GLMM.covariance(objct)
+#    K = K + (1e-3 * np.identity(K.shape[0]))
+#    
+#    tau = objct._ep._posterior.tau
+#    tau = tau + 1e-3
+#    
+#    if not np.all(np.isfinite(1 / tau)):
+#        raise Exception("Tau is way to small")
+#        pdb.set_trace();
+#    if not np.all(np.isfinite(K)):
+#        raise Exception("What? K is weird man...");
+#        pdb.set_trace();
+#    
+#    np.savetxt("./K."+feature+".txt",K)
+#    np.savetxt("./tau."+feature+".txt",tau)
+#    
+#    return pinv(pinv(K + np.diag(1 / tau)))
