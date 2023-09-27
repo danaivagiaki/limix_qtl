@@ -92,7 +92,7 @@ def get_interaction_args():
                         help=
                         'A genomic range to do selecte features to be considered in the analysis.'
                         'Available options: all (default), a chromsome or chromosome:start-end.',default='all')
-    parser.add_argument('--covariates_file','-cf',required=False,default=None)
+    parser.add_argument('--covariates_file','-cf',required=True,default=None)
     parser.add_argument('--randomeff_files','-rf',required=False,default=None,
                         help = """The random effect files divided by a comma. The first one should be the kinship file and the second one should contain the read depth. You can also
                                just input only one of them but the order is important""")
@@ -113,8 +113,9 @@ def get_interaction_args():
                         'This can be used to either link multiple test regions to one feature or exclude multiple regions while testing a feature.', required=False)
     parser.add_argument('--regress_snp_interaction','-rsi', action="store_true",required=False,default=False)
     parser.add_argument("--regress_covariates","-rc",
-                        action="store_true",
-                        help="Regress-out covariates, using a LMM, before running the QTL mapping.", default=False)
+                        help= 'This first regresses out the effect of the covariates before fitting the LMM to test the effects for speed.'
+                        'WARNING: It assumes you have your interaction term as your first covariate in the covariate file.',
+                        action="store_true", default=False)
     parser.add_argument('--relatedness_score','-rs',required=False,default=None)
     parser.add_argument('--write_permutations','-wp',action="store_true",required=False,default=False)
     parser.add_argument('--write_zscores','-wz',action="store_true",required=False,default=False)

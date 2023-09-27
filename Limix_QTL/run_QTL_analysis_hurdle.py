@@ -12,7 +12,8 @@ import pandas as pd
 import numpy as np
 import math
 from sklearn.impute import SimpleImputer
-from glimix_core.lmm import LMM
+from glimix_core.lmm import LMM, FastScanner
+from glimix_core.glmm import GLMMExpFam
 import dask.array as da
 #Internal code.
 import qtl_output
@@ -23,26 +24,25 @@ from qtl_snp_qc import do_snp_qc
 import time
 #V0.2.0
 
-def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, output_dir, interaction_term, window_size=250000,
-                                 min_maf=0.05, min_hwe_P=0.001, min_call_rate=0.95, blocksize=1000, cis_mode=True,
-                                 skipAutosomeFiltering = False, gaussianize_method=None, minimum_test_samples= 10,
-                                 seed=np.random.randint(40000), n_perm=0, write_permutations = False, write_zscore = False, write_feature_top_permutations = False,
-                                 relatedness_score=0.95, feature_variant_covariate_filename = None, snps_filename=None, feature_filename=None, 
-                                 snp_feature_filename=None, genetic_range='all', covariates_filename=None, randomeff_filename=None, 
-                                 sample_mapping_filename=None, extended_anno_filename=None, regressCovariatesUpfront = False, lr_random_effect = False, debugger=False, regres_snp_from_env=False):
+def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, output_dir, window_size=250000,
+                     min_maf=0.05, min_hwe_P=0.001, min_call_rate=None, blocksize=1000, cis_mode=True,
+                     skipAutosomeFiltering = False, gaussianize_method=None, minimum_test_samples= 10,
+                     seed=np.random.randint(40000), n_perm=0, write_permutations = False, write_zscore = False, write_feature_top_permutations = False,
+                     relatedness_score=0.95, feature_variant_covariate_filename = None, snps_filename=None, feature_filename=None,
+                     snp_feature_filename=None, genetic_range='all', covariates_filename=None, randomeff_filename=None,
+                     sample_mapping_filename=None, extended_anno_filename=None, regressCovariatesUpfront = False, lr_random_effect = False, debugger=False):
     if debugger:
         fun_start = time.time()
     
     ##Ensure output directory
     qtl_loader_utils.ensure_dir(output_dir)
     
-    print('Running interaction QTL analysis.')
+    print('Running QTL analysis.')
     #Define start objects (p1)
     tot_time = 0
     idx = 0
 
     fill_NaN = SimpleImputer(missing_values=np.nan, strategy='mean', copy=False)
-                                              
     lik = 'normal'
     minimumProbabilityStep=0.1
 
@@ -74,8 +74,7 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
     # Check if kinship matrix is present. The matrix of pairwise genotype similarity. If they are not present took genetically unique individuals based on IDs
     mixed = kinship_df is not None
     if (kinship_df is None) or (relatedness_score is None) :
-        geneticaly_unique_individuals = np.unique(sample2individual_df['iid'])
-
+        geneticaly_unique_individuals = np.unique(sample2individual_df['iid'].values)
     
     # Check if feature list is empty (genes)
     if(feature_list==None or len(feature_list)==0):
@@ -87,13 +86,9 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
         fun_start = time.time()
     qtl_loader_utils.ensure_dir(output_dir)
     if not selectionStart is None :
-        output_writer = qtl_output.hdf5_writer(output_dir+'/iqtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
-        output_writer_snp = qtl_output.hdf5_writer(output_dir+'/iqtl_results_snp_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
-        output_writer_cov = qtl_output.hdf5_writer(output_dir+'/iqtl_results_cov_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
+        output_writer = qtl_output.hdf5_writer(output_dir+'/qtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
     else :
-        output_writer = qtl_output.hdf5_writer(output_dir+'/iqtl_results_{}.h5'.format(chromosome))
-        output_writer_snp = qtl_output.hdf5_writer(output_dir+'/iqtl_results_snp_{}.h5'.format(chromosome))
-        output_writer_cov = qtl_output.hdf5_writer(output_dir+'/iqtl_results_cov_{}.h5'.format(chromosome))
+        output_writer = qtl_output.hdf5_writer(output_dir+'/qtl_results_{}.h5'.format(chromosome))
     if(write_permutations):
         if not selectionStart is None :
             permutation_writer = qtl_output.hdf5_permutations_writer(output_dir+'/perm_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd),n_perm)
@@ -103,13 +98,7 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
         fun_end = time.time()
         print(" Opening writing files took {}".format(fun_end-fun_start))
 
-    if(covariate_df is None or not (interaction_term in covariate_df.columns)):
-        print ('Interaction term is not found in the covariates')
-        print((interaction_term))
-        sys.exit()
-    
     #Arrays to store indices of snps tested and pass and fail QC SNPs for features without missingness.
-    QS = None
     tested_snp_ids = []
     pass_qc_snps_all = []
     fail_qc_snps_all = []
@@ -123,8 +112,6 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
     snpQcInfoMain = None
     random_eff_param = []
     log = {}
-    Sigma = {}
-    Sigma_qs = {}
     randomeff_mix = False
     
     minRho = 0.1
@@ -152,7 +139,20 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
 
     # start per feature computations
     for feature_id in feature_list:
+        Sigma = {}
+        Sigma_c = {}
+        Sigma_qs = {}
+        Sigma_qs_c = {}
+        QS = None
+        QS_c = None
+        ##
+        lmm = None
+        lmmA = None
+        glmm = None
+        ##
         gc.collect()
+        ##
+        
         start_time = time.time()
         # log file production for rho values storing and computation time
         log[(feature_id)] = []
@@ -286,6 +286,23 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
 
             print ('For feature: ' +str(currentFeatureNumber)+ '/'+str(len(feature_list))+ ' (' + feature_id + '): ' + str(snpQuery.shape[0]) + ' SNPs need to be tested.\n Please stand by.')
 
+            ###########################################################################################################################################################
+            # Check for zero's. Zero value might come in handy later. Expected non-centered data! (zero should be the min value).
+            
+            zeroValue = 0 ##Put as value might become different from zero after nomalization.
+            
+            geneticaly_unique_individuals_c = None
+            if(np.min(phenotype_ds.values) < zeroValue):
+                print ('The provided data ranges below 0. This is not allowed in the hurdle mode.')
+                sys.exit()
+            
+            individual_ids_c = sample2individual_df.loc[phenotype_ds[phenotype_ds > zeroValue].index,'iid'].values
+            phenotype_ids_c = phenotype_ds[phenotype_ds > zeroValue].index
+            if(len(individual_ids_c)==len(phenotype_ds.index)):
+                zeroValue=np.nan
+            else : 
+                geneticaly_unique_individuals_c = utils.get_unique_genetic_samples(kinship_df.loc[individual_ids_c,individual_ids_c], relatedness_score);
+                
             ##########################################################################################################################################################
             # SNP TESTING
             ##########################################################################################################################################################
@@ -308,6 +325,7 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                 
                 if debugger:
                     fun_start = time.time()
+                
                 if kinship_df is not None and randomeff_df is None:
                     if( not lr_random_effect):
                         kinship_mat = kinship_df.loc[individual_ids,individual_ids].values
@@ -322,11 +340,25 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                         kinship_mat = kinship_mat.astype(float)
                         if(QS is None or contains_missing_samples):
                             QS = utils.economic_qs_linear(kinship_mat, return_q1=False)
+                    #New.
+                    if(not np.isnan(zeroValue)):
+                        if( not lr_random_effect):
+                            kinship_mat_c = kinship_df.loc[individual_ids_c,individual_ids_c].values
+                            kinship_mat_c = kinship_mat_c.astype(float)
+                            ##GOWER normalization of Kinship matrix.
+                            kinship_mat_c *= (kinship_mat_c.shape[0] - 1) / (kinship_mat_c.trace() - kinship_mat_c.mean(0).sum())
+                            ## This needs to go with the subselection stuff.
+                            QS_c = utils.economic_qs(kinship_mat_c)
+                        elif(lr_random_effect):
+                            kinship_mat_c = kinship_df.loc[individual_ids_c,:].values
+                            kinship_mat_c = kinship_mat_c.astype(float)
+                            QS_c = utils.economic_qs_linear(kinship_mat_c, return_q1=False)
+                
                 # combining the two matrices
                 if kinship_df is not None and randomeff_df is not None:
+                    randomeff_mix = True
                     #Here we need to match names and make sure that the order is the same and the right samples get mixed.
                     if( not lr_random_effect):
-                        randomeff_mix = True
                         if(not Sigma_qs or contains_missing_samples):
                             kinship_mat = kinship_df.loc[individual_ids,individual_ids].values
                             kinship_mat = kinship_mat.astype(float)
@@ -343,7 +375,6 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                                 Sigma[rho] *= (Sigma[rho].shape[0] - 1) / (Sigma[rho].trace() - Sigma[rho].mean(0).sum())
                                 Sigma_qs[rho] = utils.economic_qs(Sigma[rho])
                     elif(lr_random_effect):
-                        randomeff_mix = True
                         if(not Sigma_qs or contains_missing_samples):
                             ##We only take the genetically unique indivudals to reflect the kinship here.
                             kinship_mat = kinship_df.loc[individual_ids,geneticaly_unique_individuals].values
@@ -358,24 +389,41 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                             for rho in rho1:
                                 ##Stck the two matrices together [per rho value]
                                 Sigma_qs[rho] = utils.economic_qs_linear(np.concatenate([np.sqrt(rho) * kinship_mat] + [np.sqrt(1 - rho) * randomeff_mat], axis=1), return_q1=False)
-
-                    else:
-                        print ('There is an issue in mapping between the second random effect term and the main association information.')
-                        sys.exit()
-
-                ##This cant happen!
-                # if kinship_df is None and randomeff_df is not None: 
-                #     randomeff_mat = randomeff_df.loc[individual_ids,individual_ids].values
-                #     randomeff_mat = randomeff_mat.astype(float)
-
-                #     ##GOWER normalization of Kinship matrix.
-                #     randomeff_mat *= (randomeff_mat.shape[0] - 1) / (randomeff_mat.trace() - randomeff_mat.mean(0).sum())
-                #     ## This needs to go with the subselection stuff.
-                #     if(QS is None and not contains_missing_samples):
-                #         QS = utils.economic_qs(randomeff_mat)
-                #     elif (contains_missing_samples):
-                #         QS = utils.economic_qs(randomeff_mat)
-
+                                
+                    if(not np.isnan(zeroValue)):
+                        #Here we need to match names and make sure that the order is the same and the right samples get mixed.
+                        if( not lr_random_effect):
+                            kinship_mat_c = kinship_df.loc[individual_ids_c,individual_ids_c].values
+                            kinship_mat_c = kinship_mat_c.astype(float)
+                            randomeff_mat_c = randomeff_df.loc[phenotype_ids_c,phenotype_ids_c].values
+                            randomeff_mat_c = randomeff_mat_c.astype(float)
+                            
+                            if (not (kinship_mat_c.shape[0] == randomeff_mat_c.shape[0] and  kinship_mat_c.shape[1] == randomeff_mat_c.shape[1])):
+                                print ('There is an issue in mapping between the second random effect term and the main association information.')
+                                sys.exit()
+                            
+                            for rho in rho1:
+                                Sigma_c[rho] = rho * kinship_mat_c + (1 - rho) * randomeff_mat
+                                ##GOWER normalization of Kinship matrix.
+                                Sigma_c[rho] *= (Sigma_c[rho].shape[0] - 1) / (Sigma_c[rho].trace() - Sigma_c[rho].mean(0).sum())
+                                Sigma_qs_c[rho] = utils.economic_qs(Sigma_c[rho])
+                        elif(lr_random_effect):
+                            ##We only take the genetically unique indivudals to reflect the kinship here.
+                            kinship_mat_c = kinship_df.loc[individual_ids_c,geneticaly_unique_individuals_c].values
+                            kinship_mat_c = kinship_mat_c.astype(float)
+                            randomeff_mat_c = randomeff_df.loc[phenotype_ids_c,:].values
+                            randomeff_mat_c = randomeff_mat_c.astype(float)
+                            
+                            if (kinship_mat_c.shape[0] != randomeff_mat_c.shape[0]):
+                                print ('There is an issue in mapping between the second random effect term and the main association information.')
+                                sys.exit()
+                            
+                            for rho in rho1:
+                                ##Stck the two matrices together [per rho value]
+                                Sigma_qs_c[rho] = utils.economic_qs_linear(np.concatenate([np.sqrt(rho) * kinship_mat_c] + [np.sqrt(1 - rho) * randomeff_mat], axis=1), return_q1=False)
+                Sigma = {} #to free up memory
+                Sigma_c = {} #to free up memory
+                
                 # creating a fake QS if none random effect is present or use the read depth one
                 if kinship_df is None:
                     if randomeff_df is None:
@@ -386,10 +434,19 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                             QS = utils.economic_qs(K)
                     else:
                         if(QS is None and not contains_missing_samples):
-                            QS = utils.economic_qs(randomeff_df)
+                            QS = utils.economic_qs(randomeff_df.loc[sample2individual_feature['sample'],:].values) ##This is wrong.
                         elif (contains_missing_samples):
-                            QS = utils.economic_qs(randomeff_df)
-
+                            QS = utils.economic_qs(randomeff_df.loc[sample2individual_feature['sample'],:].values) ##This is wrong.
+                    if(not np.isnan(zeroValue)):
+                        if randomeff_df is None:
+                            QS_c = utils.economic_qs(np.eye(len(phenotype_ids_c)))
+                        else:
+                            if(QS is None and not contains_missing_samples):
+                                QS_c = utils.economic_qs(randomeff_df.loc[phenotype_ids_c,:].values)
+                            elif (contains_missing_samples):
+                                QS_c = utils.economic_qs(randomeff_df.loc[phenotype_ids_c,:].values)
+                ##For hurdle model.
+                
                 if debugger:
                     fun_end = time.time()
                     print(" Computing QS took {}".format(fun_end-fun_start))
@@ -397,37 +454,164 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
 
                 #######################################################################################################################################################
                 # covariance matrix setting
-                cov_matrix =  covariate_df.loc[sample2individual_feature['sample'],:] if covariate_df is not None else None
-                inter = cov_matrix.loc[:,interaction_term]
-                cov_matrix =  cov_matrix.values
-                cov_matrix = cov_matrix.astype(float)
+                cov_matrix =  covariate_df.loc[sample2individual_feature['sample'],:].values if covariate_df is not None else None
+                cov_matrix_c = covariate_df.loc[phenotype_ids_c,:].values if covariate_df is not None else None
+                if covariate_df is None:
+                    cov_matrix = np.ones((len(individual_ids), 1))
+                    if(not np.isnan(zeroValue)):
+                        cov_matrix_c = np.ones((len(phenotype_ids_c), 1)) ##Might not be okay.
+                
                 if snp_cov_df is not None:
                     snp_cov_df_tmp = snp_cov_df.loc[individual_ids,:]
                     snp_cov_df_tmp.index=sample2individual_feature['sample']
                     snp_cov_df = pd.DataFrame(fill_NaN.fit_transform(snp_cov_df_tmp))
                     snp_cov_df.index=snp_cov_df_tmp.index
                     snp_cov_df.columns=snp_cov_df_tmp.columns
-                    cov_matrix = np.concatenate((cov_matrix,snp_cov_df.values),1)
                     snp_cov_df_tmp = None
+                    cov_matrix = np.concatenate((cov_matrix,snp_cov_df.values),1)
                     snp_cov_df = None
+                    if(not np.isnan(zeroValue)):
+                        print("This is not supported yet, hurdle model with SNP regression.")
+                        sys.exit()
                 cov_matrix = cov_matrix.astype(float)
+                if(not np.isnan(zeroValue)):
+                    cov_matrix_c = cov_matrix_c.astype(float)
                 #######################################################################################################################################################
             else:
                 print ('There is an issue in mapping phenotypes vs covariates and/or kinship and/or second random effect term.')
                 sys.exit()
             
             ###########################################################################################################################################################
-            # force normal distribution of expression values
+            # force normal distribution of expression values, this needs to change too.
+            
+            if(not np.isnan(zeroValue)):
+                phenotype_c = utils.force_normal_distribution(phenotype_ds[phenotype_ids_c].values,method=gaussianize_method) if gaussianize_method is not None else phenotype_ds[phenotype_ids_c].values
+                phenotype_c = phenotype_c.astype(float)
+                
+                phenotype_b = phenotype_ds.copy()
+                phenotype_b[phenotype_b.values>0] = 1
+            
+            ##Always also use all data (for total effect size).
             phenotype = utils.force_normal_distribution(phenotype_ds.values,method=gaussianize_method) if gaussianize_method is not None else phenotype_ds.values
             phenotype = phenotype.astype(float)
+            
             ###########################################################################################################################################################
+            #Prepare LMMs continous part and binary part.
+            ##########################################################################################################################################################
+            
+            ##The continous part is the same as before. New is the binary part.
+            # Computing Null Model 
+            print("Fitting three null models (LMM on all data, LMM on continous part and the GLMM on binarized data)")
+            if debugger:
+                fun_start = time.time()
+            if randomeff_mix:
+                
+                ##Optimization of mixing parameters happens on all the data (non-hurdle, might not be ideal).
+                
+                ## high rho means a strong effect of the kinship matrix, low rho is a strong effect of the other matrix.
+                #mixingParameters = utils.rhoTest(best=None, phenotype = phenotype, cov_matrix=cov_matrix, Sigma_qs=Sigma_qs, mixed=mixed, lastMove=None, rhoArray = rho1, verbose = True)
+                mixingParameters = utils.rhoTestBF(best=None, phenotype = phenotype, cov_matrix=cov_matrix, Sigma_qs=Sigma_qs, mixed=mixed, lastMove=None, rhoArray = rho1, verbose = False)
+                
+                lmmA = mixingParameters["lmm"]
+                feature_best_rho = mixingParameters["rho"]
+                log[(feature_id)].append(feature_best_rho)
+                
+                if(not np.isnan(zeroValue)):
+                    glmm = GLMMExpFam(phenotype_b, "bernoulli", cov_matrix, Sigma_qs[feature_best_rho])
+                    glmm.fit(verbose=False)
+                    lmm = LMM(phenotype_c, cov_matrix_c, Sigma_qs_c[feature_best_rho])
+                    lmm.fit(verbose=False)
+                else:
+                    lmm = lmmA ##Is already fitted.
+                
+                if debugger:
+                    if mixingParameters["rho"]!=1:
+                        print("Random effect has influence, mixing parameter: "+str(feature_best_rho))
+                    else :
+                        print("Only kinship has effect, rho 1.")
+                
+            else:
+                lmmA = LMM(phenotype, cov_matrix, QS)
+                if(not np.isnan(zeroValue)):
+                    glmm = GLMMExpFam(phenotype_b, "bernoulli", cov_matrix, QS)
+                    lmm = LMM(phenotype_c, cov_matrix_c, QS_c)
+                else :
+                    lmm = lmmA
+                
+                if not mixed:
+                    lmm.delta = 1
+                    lmm.fix('delta')
+                    lmmA.delta = 1
+                    lmmA.fix('delta')
+                    glmm.delta = 1
+                    glmm.fix('delta')
+                lmmA.fit(verbose=False)
+                lmm.fit(verbose=False)
+                
+                #pdb.set_trace();
+                #np.savez("/home/m414r/glmmFit"+feature_id+".npz", phen=phenotype_b, covM=cov_matrix, Q0 = np.asarray(QS[0]), Q1 = np.asarray(QS[1]))
+                if(not np.isnan(zeroValue)):
+                    glmm.fit(verbose=False)
+            print("Done.")
+            if debugger:
+                fun_end = time.time()
+                print(" Computing Null model took {}".format(fun_end-fun_start))
+            ##########################################################################################################################################################
+
+            ##########################################################################################################################################################
+            # Regressing up covariates
+            if debugger:
+                fun_start = time.time()
+            if regressCovariatesUpfront:
+                print("Not supported for the hurdle mode (skipping).")
+                #pdb.set_trace();
+                ##What correction makes most sense here? This would be just correcting the continous part. [Correcting binary doesn't make sense.]
+                #if(not np.isnan(zeroValue)):
+                #    phenotype_corrected = phenotype_c-cov_matrix_c[:,1:].dot(lmm.beta[1:])
+                #    cov_matrix_corrected = cov_matrix_c[:,0]
+                #else: 
+                #    phenotype_corrected = phenotype_c-cov_matrix[:,1:].dot(lmm.beta[1:])
+                #    cov_matrix_corrected = cov_matrix[:,0]
+                #if randomeff_mix:
+                #    lmm = LMM(phenotype_corrected, cov_matrix_corrected, Sigma_qs[mixingParameters["rho"]])
+                #else:
+                #    lmm = LMM(phenotype_corrected, cov_matrix_corrected, QS)
+                #lmm.fit(verbose=False)
+            if debugger:
+                fun_end = time.time()
+                print(" Regressing Covariates took {}".format(fun_end-fun_start))
+            ##########################################################################################################################################################
+            if debugger:
+                fun_start = time.time()
+            
+            null_lml = lmm.lml()
+            null_glml = None
+            
+            flmm = lmm.get_fast_scanner()
+            flmmA = lmmA.get_fast_scanner()
+            fglmm = None
+            
+            if(not np.isnan(zeroValue)):
+                ##This is the "most" experimental part, we use the LMM to approximate the GLMM, to use the fast scanner.
+                ##Q: Do we want to do a logit / probit here on the phenotype? 
+                ##Plus we use the "utils.glmm_posteriori_covariance_safe_decomposition()" instead of the normal "glmm.posteriori_covariance()", which adds a small offset, to make sure the matrix is not singular.
+                print("Fitting LMM to approximate the GLMM on the binary data.")
+                fglmm = FastScanner(phenotype_b.values, cov_matrix, utils.economic_qs(utils.glmm_posteriori_covariance_safe_decomposition(glmm,feature_id)), 0) 
+                print("Done.")
+                null_glml = fglmm.null_lml()
+                
+            countChunker = 0
+            if debugger:
+                fun_end = time.time()
+                print(" Start scanning took {}".format(fun_end-fun_start))
             
             ##########################################################################################################################################################
-            # Iterate according to a blocksize 
-            countChunker = 0
+            # Fast scanning - iterate according to a blocksize 
             for snpGroup in utils.chunker(snpQuery, blocksize):
                 countChunker=countChunker+1
                 #print(countChunker)
+                #Fix seed at the start of the first chunker so all permutations are based on the same random first split.
+                np.random.seed(seed)
                 #print(snpGroup)
                 snp_idxs = snpGroup['i'].values
                 snp_names = snpGroup['snp'].values
@@ -465,8 +649,8 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                     snp_df_dosage = snp_df_dosage.loc[np.unique(individual_ids),:]
                 
                 snp_df = snp_df.loc[np.unique(individual_ids),:]
-            
-                ##snp_df = snp_df.loc[:,np.unique(snp_df.columns)[np.unique(snp_df.columns,return_counts=1)[1]==1]]
+                
+                ## snp_df = snp_df.loc[:,np.unique(snp_df.columns)[np.unique(snp_df.columns,return_counts=1)[1]==1]] ##this should not be necessary.
                 if debugger:
                     fun_end = time.time()
                     print(" Subsetting genotype matrix took {}".format(fun_end-fun_start))
@@ -511,7 +695,7 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                     fun_end = time.time()
                     print(" SNP quality control took {}".format(fun_end-fun_start))
                 ##########################################################################################################################################################
-
+                
                 call_rate = None
                 maf = None
                 hweP = None
@@ -520,10 +704,10 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                     snpQcInfo = snpQcInfo_t
                 elif snpQcInfo_t is not None:
                     snpQcInfo = pd.concat([snpQcInfo, snpQcInfo_t], axis=0, sort = False)
-                ##First process SNPQc than check if si can continue.
+                ##First process SNPQc than check if i can continue.
                 if len(snp_df.columns) == 0:
                     continue
-                ##If we use bgen we replace the genotypes here to only have the dosage matrix in mem. Trying to save some memory.
+                ##If we use bgen we replace the genotypes here to only have the dosage matrix in mem. Trying to safe some memory.
                 if (not plinkGenotype):
                     snp_df= snp_df_dosage.loc[:,np.unique(snp_df.columns)]
                     snp_df_dosage = None
@@ -531,217 +715,178 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
                 snp_df = pd.DataFrame(fill_NaN.fit_transform(snp_df),index=snp_df.index,columns=snp_df.columns)
                 ##No more snp_matrix_DF > snp_df
 #                test if the covariates, kinship, snp and phenotype are in the same order
+                
                 if (len(snp_df.loc[individual_ids,:].index) != len(sample2individual_feature.loc[phenotype_ds.index]['iid']) or not all(snp_df.loc[individual_ids,:].index==sample2individual_feature.loc[phenotype_ds.index]['iid'])):
                     print ('There is an issue in mapping phenotypes and genotypes')
                     sys.exit()
-                #print(snp_df)
-                #pdb.set_trace()
+
                 ##########################################################################################################################################################
                 # SCANNING
                 if debugger:
                     fun_start = time.time()
+                G = snp_df.loc[individual_ids,:].values
+                G = G.astype(float)
+                G_index = snp_df.columns
+                
+                ##Filling temp_df with results.
+                
+                temp_df = pd.DataFrame(index = range(len(G_index)),columns=['feature_id','snp_id','p_value','beta','beta_se','empirical_feature_p_value'])
+                temp_df['snp_id'] = G_index
+                temp_df['feature_id'] = feature_id.replace("/","-")
+                #insert default dummy value
+                temp_df['empirical_feature_p_value'] = -1.0
+                
+                if(not np.isnan(zeroValue)):
+                    Gc = snp_df.loc[individual_ids_c,:].values
+                    Gc = Gc.astype(float)
                     
-                for snp_selection in snp_df.columns:
-                    #Fix seed for every SNP in the snp_df.
-                    np.random.seed(seed)
+                    scannerOut = flmmA.fast_scan(G, verbose=False)
+                    # alt_lmls = scannerOut['lml'] #Not using this now.
+                    effsizes_a = scannerOut['effsizes1']
+                    var_effsizes_se_a = scannerOut['effsizes1_se']
+                    # var_pvalues = utils.lrt_pvalues(flmmA.null_lml(), scannerOut['lml']) #Not using this now.
                     
-                    #print(snp_selection)
-                    #pdb.set_trace()
-                    snpForTest = snp_df.loc[individual_ids,snp_selection].copy(deep=True)
-                    if (not plinkGenotype):
-                        snpForTest = snp_df_dosage.loc[individual_ids,snp_selection].copy(deep=True)
+                    scannerOut_c = flmm.fast_scan(Gc, verbose=False)
+                    alt_lmls = scannerOut_c['lml']
+                    # effsizes = scannerOut_c['effsizes1'] #Not using this now.
+                    # var_effsizes_se = scannerOut_c['effsizes1_se'] #Not using this now.
+                    # var_pvalues = utils.lrt_pvalues(null_lml, alt_lmls) #Not using this now.
                     
-                    cov_matrix_snp = np.column_stack((cov_matrix, snpForTest))
+                    scannerOut_b = fglmm.fast_scan(G, verbose=False)
+                    alt_glmls = scannerOut_b['lml']
+                    # effsizes_g = scannerOut_b['effsizes1'] #Not using this now.
+                    # var_effsizes_g_se = scannerOut_b['effsizes1_se'] #Not using this now.
+                    # var_pvalues_g = utils.lrt_pvalues(fglmm.null_lml(), alt_glmls) #Not using this now.
                     
-                    ##########################################################################################################################################################
-                    # Computing Null Model per SNP (needed for interaction tests)
-                    if debugger:
-                        fun_start = time.time()
-                    if randomeff_mix:
-                        #mixingParameters = utils.rhoTest(best=None, phenotype = phenotype, cov_matrix=cov_matrix_snp, Sigma_qs=Sigma_qs, mixed=mixed, lastMove=None, rhoArray = rho1, verbose = True)
-                        mixingParameters = utils.rhoTestBF(best=None, phenotype = phenotype, cov_matrix=cov_matrix_snp, Sigma_qs=Sigma_qs, mixed=mixed, lastMove=None, rhoArray = rho1, verbose = False)
-                        
-                        lmm = mixingParameters["lmm"]
-                        feature_best_rho = mixingParameters["rho"]
-                        log[(feature_id)].append(feature_best_rho)
-                        
-                        if debugger:
-                            if mixingParameters["rho"]!=0:
-                                print("Random effect has influence, mixing parameter: "+str(feature_best_rho))
-                            else :
-                                print("Only kinship has effect.")
-                            
-                    else:
-                        lmm = LMM(phenotype, cov_matrix_snp, QS)
-                        if not mixed:
-                            lmm.delta = 1
-                            lmm.fix('delta')
-                        lmm.fit(verbose=False)
-                    if debugger:
-                        fun_end = time.time()
-                        print(" Computing Null model took {}".format(fun_end-fun_start))
-                    ##########################################################################################################################################################
+                    ##Total LML (Hurdle p.value)
+                    total_var_pvalues = utils.lrt_pvalues(fglmm.null_lml()+null_lml, alt_glmls+alt_lmls,dof=2)
                     
-                    ##########################################################################################################################################################
-                    # Regressing up covariates
-                    if debugger:
-                        fun_start = time.time()
-                    if regressCovariatesUpfront:
-                        #pdb.set_trace();
-                        phenotype_corrected = phenotype-cov_matrix[:,1:].dot(lmm.beta[1:-1])
-                        cov_matrix_corrected = cov_matrix[:,0]
-                        if randomeff_mix:
-                            lmm = LMM(phenotype_corrected, cov_matrix_corrected, Sigma_qs[mixingParameters["rho"]])
-                        else:
-                            lmm = LMM(phenotype_corrected, cov_matrix_corrected, QS)
-                        lmm.fit(verbose=False)
-                    if debugger:
-                        fun_end = time.time()
-                        print(" Regressing Covariates took {}".format(fun_end-fun_start))
-                    ##########################################################################################################################################################
+                    ## var_pvalues_g = utils.lrt_pvalues(null_glml, alt_glmls) (original) 
                     
-                    if debugger:
-                        fun_start = time.time()
-                    null_lml = lmm.lml()
-                    flmm = lmm.get_fast_scanner()
+                    #for col in range(G.shape[1]):
+                    #    cov_matrixVar = np.c_[cov_matrix,G[:,col]]
+                    #    glmmT = GLMMExpFam(phenotype_b, "bernoulli", cov_matrixVar, QS)
+                    #    glmmT.fit(verbose=False)
+                    #    print(glmmT.lml())
+                    #    print(utils.lrt_pvalues(null_glml, glmmT.lml()))
                     
-                    if debugger:
-                        fun_end = time.time()
-                        print(" Start scanning took {}".format(fun_end-fun_start))
+                    ##We take the continous (LMM) fit to reflect the effect size.
+                    ##There are several alternatives. Best would be to store all 3 effect sizes + se's, Alternative is a Z based Pvalue integration.
+                    temp_df['beta'] = np.asarray(effsizes_a)
+                    temp_df['beta_se'] = np.asarray(var_effsizes_se_a)
+                    ##We take the the hurdle lmls to derive the Pvalue.
+                    temp_df['p_value'] = np.asarray(total_var_pvalues)
                     
-                    if(regres_snp_from_env):
-                        inter = utils.regressOut(inter,np.concatenate(([snpForTest], [np.ones_like(inter.values)]),axis=0).T)
-                    #pdb.set_trace()
-                    G = np.atleast_2d((snpForTest.values * inter.values).T).T
-                    G = G.astype(float)
-                    ## G_index = snp_selection (Dropping this)
-                    
+                else :
                     scannerOut = flmm.fast_scan(G, verbose=False)
-                    #pdb.set_trace()
                     alt_lmls = scannerOut['lml']
                     effsizes = scannerOut['effsizes1']
                     var_effsizes_se = scannerOut['effsizes1_se']
                     var_pvalues = utils.lrt_pvalues(null_lml, alt_lmls)
-                    if debugger:
-                        fun_end = time.time()
-                        print(" Actual scanning took {}".format(fun_end-fun_start))
-                    #########################################################################################################################################################
-                    #pdb.set_trace()
-                    #add these results to ults
-                    temp_df_snp = pd.DataFrame(index = range(1),columns=['feature_id','snp_id','p_value','beta','beta_se','empirical_feature_p_value'])
-                    temp_df_snp['snp_id'] = snp_selection
-                    temp_df_snp['feature_id'] = feature_id
-                    temp_df_snp['beta'] = np.asarray(scannerOut['effsizes0'][0][(scannerOut['effsizes0'][0].shape[0])-1])
-                    temp_df_snp['p_value'] = -1.0
-                    temp_df_snp['beta_se'] = np.asarray(scannerOut['effsizes0_se'][0][(scannerOut['effsizes0_se'][0].shape[0])-1])
-                    #insert default dummy value
-                    temp_df_snp['empirical_feature_p_value'] = -1.0
                     
-                    temp_df_cov = pd.DataFrame(index = range(1),columns=['feature_id','snp_id','p_value','beta','beta_se','empirical_feature_p_value'])
-                    temp_df_cov['snp_id'] = snp_selection
-                    temp_df_cov['feature_id'] = feature_id
-                    temp_df_cov['beta'] = np.asarray(scannerOut['effsizes0'][0][np.where(covariate_df.columns==interaction_term)[0][0]])
-                    temp_df_cov['p_value'] = -1.0
-                    temp_df_cov['beta_se'] = np.asarray(scannerOut['effsizes0_se'][0][np.where(covariate_df.columns==interaction_term)[0][0]])
-                    #insert default dummy value
-                    temp_df_cov['empirical_feature_p_value'] = -1.0
-                    
-                    #add these results to ults
-                    temp_df = pd.DataFrame(index = range(1),columns=['feature_id','snp_id','p_value','beta','beta_se','empirical_feature_p_value'])
-                    temp_df['snp_id'] = snp_selection
-                    temp_df['feature_id'] = feature_id
+                    ##Here there is no zero (binary) part so only the continous part is used for everything.
                     temp_df['beta'] = np.asarray(effsizes)
-                    temp_df['p_value'] = np.asarray(var_pvalues)
                     temp_df['beta_se'] = np.asarray(var_effsizes_se)
-                    #insert default dummy value
-                    temp_df['empirical_feature_p_value'] = -1.0
-                    ##########################################################################################################################################################
-                    # SCANNING
-                    if debugger:
-                        fun_start = time.time()
-                    if(n_perm!=0):
-                        #snpForTest = snpForTest.to_frame(name=snp_selection)
-                        pValueBuffer = []
-                        if(write_zscore):
-                            zScoreBuffer = []
-                        totalSnpsToBeTested = (G.shape[1]*n_perm)
-                        permutationStepSize = np.floor(n_perm/(totalSnpsToBeTested/blocksize))
-                        if(permutationStepSize>n_perm):
-                            permutationStepSize=n_perm
-                        elif(permutationStepSize<1):
-                            permutationStepSize=1
-                        if(write_permutations):
-                            perm_df = pd.DataFrame(index = range(1),columns=['snp_id'] + ['permutation_'+str(x) for x in range(n_perm)])
-                            perm_df['snp_id'] = snp_selection
-                        for currentNperm in utils.chunker(list(range(1, n_perm+1)), permutationStepSize):
-                            if kinship_df is not None:
-                                temp = pd.DataFrame(snpForTest.values,index=snpForTest.index,columns=[snp_selection])
-                                temp = utils.get_shuffled_interactions_preserving_kinship(temp, kinship_df, inter, geneticaly_unique_individuals, individual_ids, relatedness_score, sample2individual_feature, len(currentNperm))
-                                temp = temp.values
-                            else :
-                                temp = pd.DataFrame(np.atleast_2d((snpForTest.values * inter.values).T).T,index=snpForTest.index,columns=[snp_selection])
-                                temp = utils.get_shuffeld_genotypes(temp, len(currentNperm))
-                            #pdb.set_trace()
+                    temp_df['p_value'] = np.asarray(var_pvalues)
+                    
+                
+                if debugger:
+                    fun_end = time.time()
+                    print(" Actual scanning took {}".format(fun_end-fun_start))
+                
+                ##########################################################################################################################################################
+                # Permutation SCANNING.
+                if debugger:
+                    fun_start = time.time()
+                if(n_perm!=0):
+                    pValueBuffer = []
+                    ##Not defined for the hurdle model.
+                    # if(write_zscore):
+                    #     zScoreBuffer = []
+                    
+                    if(write_permutations):
+                        perm_df = pd.DataFrame(index = range(len(G_index)),columns=['snp_id'] + ['permutation_'+str(x) for x in range(n_perm)])
+                        perm_df['snp_id'] = G_index
+                    
+                    for col in range(n_perm):
+                        
+                        if (kinship_df is not None) and (relatedness_score is not None):
+                            temp = utils.get_shuffeld_genotypes_preserving_kinship(geneticaly_unique_individuals, relatedness_score, snp_df, kinship_df.loc[np.unique(individual_ids),np.unique(individual_ids)], 1)
+                        else:
+                            temp = utils.get_shuffeld_genotypes(snp_df, 1)
+                        ##Temporary making it into a pd dataframe.
+                        temp = pd.DataFrame(data=temp, index=snp_df.index, columns=snp_df.columns)
+                        
+                        if(not np.isnan(zeroValue)):
+                            temp_c = temp.loc[individual_ids_c,:].values
+                            temp_c = temp_c.astype(float)
+                            temp = temp.loc[individual_ids,:].values
+                            temp = temp.astype(float)
+                            scannerOut_c = flmm.fast_scan(temp_c, verbose=False)
+                            alt_lmls = scannerOut_c['lml']
+                            
+                            scannerOut_b = fglmm.fast_scan(temp, verbose=False)
+                            alt_glmls = scannerOut_b['lml']
+                            
+                            ##Total LML (Hurdle p.value)
+                            var_pvalues_p = utils.lrt_pvalues(fglmm.null_lml()+null_lml, alt_glmls+alt_lmls,dof=2)
+                        else :
+                            temp = temp.loc[individual_ids,:].values
+                            temp = temp.astype(float)
                             scannerOut = flmm.fast_scan(temp, verbose=False)
                             alt_lmls_p = scannerOut['lml']
+                            ##Total LML (only continous data so LMM p.value)
                             var_pvalues_p = utils.lrt_pvalues(null_lml, alt_lmls_p)
-                            
-                            if(write_zscore):
-                                zScoreBuffer.extend(np.asarray(scannerOut['effsizes1']/scannerOut['effsizes1_se']))
-                            
-                            pValueBuffer.extend(np.asarray(var_pvalues_p))
-                        if(not(len(pValueBuffer)==totalSnpsToBeTested)):
-                            print(len(pValueBuffer))
-                            print(pValueBuffer)
-                            print(totalSnpsToBeTested)
-                            print('Error in blocking logic for permutations.')
-                            sys.exit()
-                        perm = 0
-                        for relevantOutput in utils.chunker(pValueBuffer,G.shape[1]) :
-                            if(write_permutations):
-                                if(write_zscore):
-                                    sPos = 0 + G.shape[1]*perm
-                                    ePos = sPos + G.shape[1]
-                                    perm_df['permutation_'+str(perm)] = zScoreBuffer[sPos:ePos]
-                                else :
-                                    perm_df['permutation_'+str(perm)] = relevantOutput
-                            if(bestPermutationPval[perm] > min(relevantOutput)):
-                                bestPermutationPval[perm] = min(relevantOutput)
-                            perm = perm+1
-                            #print(relevantOutput)
-                            #print('permutation_'+str(perm))
-                
-                    if not temp_df.empty :
-                        data_written = True
-                        output_writer.add_result_df(temp_df)
-                        output_writer_snp.add_result_df(temp_df_snp)
-                        output_writer_cov.add_result_df(temp_df_cov)
+                        
+                        ##Not defined for the hurdle model.
+                        # if(write_zscore):
+                        #     zScoreBuffer.extend(np.asarray(scannerOut['effsizes1']/scannerOut['effsizes1_se']))
+                        
+                        pValueBuffer.extend(np.asarray(var_pvalues_p))
+                    perm = 0
+                    for relevantOutput in utils.chunker(pValueBuffer,G.shape[1]) :
                         if(write_permutations):
-                           permutation_writer.add_permutation_results_df(perm_df,feature_id)
-                    if debugger:
-                        fun_end = time.time()
-                        print(" Permutations took {}".format(fun_end-fun_start))
-            #This we need to change in the written file.
+                            ##Not defined for the hurdle model.
+                            # if(write_zscore):
+                            #     sPos = 0 + G.shape[1]*perm
+                            #     ePos = sPos + G.shape[1]
+                            #     perm_df['permutation_'+str(perm)] = zScoreBuffer[sPos:ePos]
+                            # else :
+                            perm_df['permutation_'+str(perm)] = relevantOutput
+                        if(bestPermutationPval[perm] > min(relevantOutput)):
+                            bestPermutationPval[perm] = min(relevantOutput)
+                        perm = perm+1
+                        #print(relevantOutput)
+                        #print('permutation_'+str(perm))
+
+                if not temp_df.empty :
+                    data_written = True
+                    output_writer.add_result_df(temp_df)
+                    if(write_permutations):
+                        permutation_writer.add_permutation_results_df(perm_df,feature_id)
+                if debugger:
+                    fun_end = time.time()
+                    print(" Permutations took {}".format(fun_end-fun_start))
+        #This we need to change in the written file.
+        if debugger:
+            fun_start = time.time()
+        
         if not data_written :
             fail_qc_features.append(feature_id)
         else:
             n_samples.append(phenotype_ds.size)
             n_e_samples.append(len(geneticaly_unique_individuals))
-            if(n_perm>1):
+            if n_perm>1 :
                 #updated_permuted_p_in_hdf5(bestPermutationPval, feature_id);
-                ##Currenty we do the permutations per feature, all permutations over the interaction terms are combined (not ideal?)
-                alpha_para, beta_para = output_writer.apply_pval_correction(feature_id,bestPermutationPval, cis_mode)
+                alpha_para, beta_para = output_writer.apply_pval_correction(feature_id.replace("/","-"),bestPermutationPval, cis_mode)
                 if write_feature_top_permutations:
                     np.savetxt(output_dir+"/Permutation.pValues."+feature_id.replace("/","-")+".txt",bestPermutationPval)
-                #np.savetxt(output_dir+"/Permutation.pValues."+feature_id+".txt",bestPermutationPval)
                 alpha_params.append(alpha_para)
                 beta_params.append(beta_para)
             if randomeff_mix :
                 random_eff_param.append(feature_best_rho)
-            
+        
         if contains_missing_samples:
-            QS = None
-            Sigma_qs = None
             geneticaly_unique_individuals = tmp_unique_individuals
             del tmp_unique_individuals
             if snpQcInfo is not None:
@@ -766,9 +911,9 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
         print("Mean: --- %s seconds ---" % (tot_time/idx))
         log[(feature_id)].append((time.time() - start_time))
         log[(feature_id)].append(tot_time/idx)
-        gc.collect()
+
     output_writer.close()
-    
+
     if(write_permutations):
         permutation_writer.close()
     fail_qc_features = np.unique(fail_qc_features)
@@ -778,13 +923,9 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
         print("Trying to remove the h5 file. Nothing has been tested.")
         print(output_dir+'qtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
         if not selectionStart is None :
-            os.remove(output_dir+'/iqtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
-            os.remove(output_dir+'/iqtl_results_snp_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
-            os.remove(output_dir+'/iqtl_results_cov_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
+            os.remove(output_dir+'qtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
         else :
-            os.remove(output_dir+'/iqtl_results_{}.h5'.format(chromosome))
-            os.remove(output_dir+'/iqtl_results_snp_{}.h5'.format(chromosome))
-            os.remove(output_dir+'/iqtl_results_cov_{}.h5'.format(chromosome))
+            os.remove(output_dir+'qtl_results_{}.h5'.format(chromosome))
         sys.exit()
     #gather unique indexes of tested SNPs
 
@@ -844,7 +985,7 @@ def run_interaction_QTL_analysis(pheno_filename, anno_filename, geno_prefix, pli
 
 
 if __name__=='__main__':
-    args = qtl_parse_args.get_interaction_args()
+    args = qtl_parse_args.get_args()
     plink  = args.plink
     bgen = args.bgen
     anno_file = args.annotation_file
@@ -871,8 +1012,6 @@ if __name__=='__main__':
     gaussianize = args.gaussianize_method
     cis = args.cis
     trans = args.trans
-    interaction_term = args.interaction_term
-    regress_out_snp_from_env = args.regress_snp_interaction
     write_permutations = args.write_permutations
     write_zscore = args.write_zscores
     includeAllChromsomes = args.no_chromosome_filter
@@ -910,9 +1049,9 @@ if __name__=='__main__':
     if(n_perm<50):
         print("Warning: With less than 50 permutations P-values correction is not very accurate.")
 
-    run_interaction_QTL_analysis(pheno_file, anno_file,geno_prefix, plinkGenotype, output_dir, interaction_term, int(window_size),
+    run_QTL_analysis(pheno_file, anno_file,geno_prefix, plinkGenotype, output_dir, int(window_size),
                      min_maf=float(min_maf), min_hwe_P=float(min_hwe_P), min_call_rate=float(min_call_rate), blocksize=int(block_size),
-                     cis_mode=cis, skipAutosomeFiltering= includeAllChromsomes, gaussianize_method = gaussianize, minimum_test_samples= int(minimum_test_samples), seed=int(random_seed), 
+                     cis_mode=cis, skipAutosomeFiltering= includeAllChromsomes, gaussianize_method = gaussianize, minimum_test_samples= int(minimum_test_samples), seed=int(random_seed),
                      n_perm=int(n_perm), write_permutations = write_permutations, write_zscore = write_zscore, write_feature_top_permutations = write_feature_top_permutations, relatedness_score=relatedness_score, feature_variant_covariate_filename = feature_variant_covariate_filename,
                      snps_filename=snps_filename, feature_filename=feature_filename, snp_feature_filename=snp_feature_filename, genetic_range=genetic_range, covariates_filename=covariates_file,
-                     randomeff_filename=randeff_file, sample_mapping_filename=samplemap_file, extended_anno_filename=extended_anno_file, regressCovariatesUpfront = regressBefore, lr_random_effect = lr_random_effect, debugger= debugger, regres_snp_from_env = regress_out_snp_from_env)
+                     randomeff_filename=randeff_file, sample_mapping_filename=samplemap_file, extended_anno_filename=extended_anno_file, regressCovariatesUpfront = regressBefore, lr_random_effect = lr_random_effect, debugger= debugger)
