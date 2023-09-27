@@ -87,14 +87,14 @@ def run_QTL_analysis(pheno_filename, anno_filename, geno_prefix, plinkGenotype, 
         fun_start = time.time()
     qtl_loader_utils.ensure_dir(output_dir)
     if not selectionStart is None :
-        output_writer = qtl_output.hdf5_writer(output_dir+'/qtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd))
+        output_writer = qtl_output.hdf5_writer(os.path.join(output_dir, 'qtl_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd)))
     else :
-        output_writer = qtl_output.hdf5_writer(output_dir+'/qtl_results_{}.h5'.format(chromosome))
+        output_writer = qtl_output.hdf5_writer(os.path.join(output_dir,'qtl_results_{}.h5'.format(chromosome)))
     if(write_permutations):
         if not selectionStart is None :
-            permutation_writer = qtl_output.hdf5_permutations_writer(output_dir+'/perm_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd),n_perm)
+            permutation_writer = qtl_output.hdf5_permutations_writer(os.path.join(output_dir, 'perm_results_{}_{}_{}.h5'.format(chromosome,selectionStart,selectionEnd)),n_perm)
         else :
-            permutation_writer = qtl_output.hdf5_permutations_writer(output_dir+'/perm_results_{}.h5'.format(chromosome),n_perm)
+            permutation_writer = qtl_output.hdf5_permutations_writer(os.path.join(output_dir, 'perm_results_{}.h5'.format(chromosome)),n_perm)
     if debugger:
         fun_end = time.time()
         print(" Opening writing files took {}".format(fun_end-fun_start))
